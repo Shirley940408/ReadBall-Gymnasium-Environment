@@ -7,6 +7,7 @@ from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 import cv2
+from irobot_create_msgs.msg import StopStatus
 
 class CreateRedBallEnv(gym.Env):
     metadata = {
@@ -25,11 +26,23 @@ class CreateRedBallEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         self.step_count = 0
-        observation = 320  # center pixel
-        return observation, {}
+        return self.redball.redball_position, {}
 
     def step(self, action):
         self.step_count += 1
+
+        # Convert discrete action (0–640) into an angular Twist
+        twist = Twist()
+        angle = (action - 320) / 320 * (np.pi / 2)
+        twist.angular.z = float(angle)
+        twist.linear.x = 0.0
+        self.redball.twist_publisher.publish(twist)
+
+        # Let ROS process the motion
+        rclpy.spin_once(self.redball)
+        while not self.redball.create3_is_stopped:
+            rclpy.spin_once(self.redball)
+
         observation = np.random.randint(0, 640)
         reward = 0
         terminated = self.step_count == 100
@@ -39,14 +52,16 @@ class CreateRedBallEnv(gym.Env):
         rclpy.spin_once(self.redball)
         return observation, reward, terminated, truncated, info
 
+    def reward(self, redball_position):
+        # Closer to 320 (center), better the reward
+        return -abs(redball_position - 320)
+
     def render(self):
-        if self.render_mode == "human":
-            pass
+        pass
 
     def close(self):
         self.redball.destroy_node()
         rclpy.shutdown()
-        pass
 
 
 class RedBall(Node):
@@ -66,7 +81,17 @@ class RedBall(Node):
     self.br = CvBridge()
     self.target_publisher = self.create_publisher(Image, 'target_redball', 10)
     self.twist_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+    self.redball_position = 320  # default to center
+    self.create3_is_stopped = True  # default
+    self.stop_sub = self.create_subscription(
+        StopStatus,
+        '/stop_status',
+        self.stop_callback,
+        10
+    )
 
+  def stop_callback(self, msg):
+    self.create3_is_stopped = msg.is_stopped
 
   def listener_callback(self, msg):
     frame = self.br.imgmsg_to_cv2(msg)
@@ -90,6 +115,8 @@ class RedBall(Node):
     the_circle = None
     if detected_circles is not None:
         for circle in detected_circles[0, :]:
+            x_center = int(circle[0])
+            self.redball_position = x_center
             circled_orig = cv2.circle(frame, (int(circle[0]), int(circle[1])), int(circle[2]), (0,255,0),thickness=3)
             the_circle = (int(circle[0]), int(circle[1]))
         self.target_publisher.publish(self.br.cv2_to_imgmsg(circled_orig))
