@@ -21,7 +21,8 @@ class CreateRedBallEnv(gym.Env):
         self.action_space = spaces.Discrete(640)
         self.step_count = 0
         # init rclpy
-        rclpy.init()
+        if not rclpy.ok():
+            rclpy.init()
         self.redball = RedBall()
 
     def reset(self, seed=None, options=None):
@@ -29,32 +30,49 @@ class CreateRedBallEnv(gym.Env):
         return self.redball.redball_position, {}
 
     def step(self, action):
+        # print(f"[STEP {self.step_count}] Previous redball_position = {self.redball.redball_position}")
         self.step_count += 1
 
-        # Convert discrete action (0–640) into an angular Twist
         twist = Twist()
-        angle = (action - 320) / 320 * (np.pi / 2)
-        twist.angular.z = float(angle)
-        twist.linear.x = 0.0
+
+        if self.step_count <= 1:
+            # 🚗 Phase 1: Move straight ahead (no turning)
+            twist.linear.x = 0.0  # move forward
+            twist.angular.z = 3.14
+            print("[PHASE 1] Driving straight to explore")
+        else:
+            # 🔁 Phase 2: Begin controlled turning using action
+            angle = (action - 320) / 320 * (np.pi / 2)
+            twist.linear.x = 0.1  # still move forward slightly
+            twist.angular.z = float(angle)*10
+
         self.redball.twist_publisher.publish(twist)
 
-        # Let ROS process the motion
-        rclpy.spin_once(self.redball)
-        while not self.redball.create3_is_stopped:
-            rclpy.spin_once(self.redball)
+        # Allow time for movement and sensor feedback
+        for _ in range(30):
+            rclpy.spin_once(self.redball, timeout_sec=0.1)
 
-        observation = np.random.randint(0, 640)
-        reward = 0
-        terminated = self.step_count == 100
+        # Get observation and reward
+        observation = self.redball.redball_position or 320
+        reward = self.reward(observation)
+        terminated = self.step_count >= 100
         truncated = False
         info = {}
-        # spin the red ball once the step() method repeatedly called by an agent
-        rclpy.spin_once(self.redball)
+
         return observation, reward, terminated, truncated, info
 
     def reward(self, redball_position):
-        # Closer to 320 (center), better the reward
-        return -abs(redball_position - 320)
+        if redball_position is None:
+            return -1.0  # ❌ Ball not seen — bad
+        distance = abs(redball_position - 320)
+        return -distance / 320  # Normalized from -1.0 (worst) to 0.0 (best)
+        # redball_position = 320 → reward = 0.0 ✅
+
+        # redball_position = 160 → reward = -0.5
+
+        # redball_position = 0 or 640 → reward = -1.0 ❌
+
+        # None → reward = -1.0 ❌
 
     def render(self):
         pass
@@ -70,18 +88,15 @@ class RedBall(Node):
   """
   def __init__(self):
     super().__init__('redball')
-    self.subscription = self.create_subscription(
-      Image,
-      'custom_ns/camera1/image_raw',
-      self.listener_callback,
-      10)
-    self.subscription # prevent unused variable warning
-
     # A converter between ROS and OpenCV images
     self.br = CvBridge()
+    self.subscription = self.create_subscription(
+      Image,
+      '/custom_ns/camera1/image_raw',
+      self.listener_callback,
+      10)
     self.target_publisher = self.create_publisher(Image, 'target_redball', 10)
     self.twist_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-    self.redball_position = 320  # default to center
     self.create3_is_stopped = True  # default
     self.stop_sub = self.create_subscription(
         StopStatus,
@@ -89,37 +104,78 @@ class RedBall(Node):
         self.stop_callback,
         10
     )
+    self.redball_position = 320  # default to center
 
   def stop_callback(self, msg):
     self.create3_is_stopped = msg.is_stopped
 
   def listener_callback(self, msg):
+    # print("[CALLBACK] Image received!")
+
+    # Convert ROS Image to OpenCV
+    frame = self.br.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+
+    # Optional: Save image for debugging
+    cv2.imwrite("frame_debug.jpg", frame)  # View with `xdg-open frame_debug.jpg`
+
+    # Convert to HSV
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # ✅ Correct red detection with wraparound (two ranges)
+# Narrower range for sharper red (you can tune further!)
+    lower_red1 = (0, 150, 150)
+    upper_red1 = (5, 255, 255)
+
+    lower_red2 = (170, 150, 150)
+    upper_red2 = (180, 255, 255)
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    # Blur & clean the mask
+    blurred_mask = cv2.GaussianBlur(mask, (9, 9), 3, 3)
+    eroded = cv2.erode(blurred_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8)))
+
+    # Detect circles
+    circles = cv2.HoughCircles(dilated, cv2.HOUGH_GRADIENT, 1, 150,
+                                param1=100, param2=20, minRadius=2, maxRadius=2000)
+
+    if circles is not None:
+        x_center = int(circles[0][0][0])
+        self.redball_position = x_center
+        print(f"[DETECTED] Red ball at x={x_center}")
+
+        # Optional: draw and publish for visualization
+        output = cv2.circle(frame, (x_center, int(circles[0][0][1])), int(circles[0][0][2]), (0, 255, 0), 3)
+        self.target_publisher.publish(self.br.cv2_to_imgmsg(output, encoding="bgr8"))
+    else:
+        print("[DETECTED] No red ball")
+
+
     frame = self.br.imgmsg_to_cv2(msg)
 
-    # convert image to BGR format (red ball becomes blue)
-    hsv_conv_img = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # convert image to HSV
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    bright_red_lower_bounds = (110, 100, 100)
-    bright_red_upper_bounds = (130, 255, 255)
-    bright_red_mask = cv2.inRange(hsv_conv_img, bright_red_lower_bounds, bright_red_upper_bounds)
+    # red ball mask
+    lower_red1 = (0, 100, 100)
+    upper_red1 = (10, 255, 255)
 
-    blurred_mask = cv2.GaussianBlur(bright_red_mask,(9,9),3,3)
-    # some morphological operations (closing) to remove small blobs
-    erode_element = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilate_element = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8))
-    eroded_mask = cv2.erode(blurred_mask,erode_element)
-    dilated_mask = cv2.dilate(eroded_mask,dilate_element)
+    lower_red2 = (160, 100, 100)
+    upper_red2 = (180, 255, 255)
+    # blur and morphology
 
-    # on the color-masked, blurred and morphed image I apply the cv2.HoughCircles-method to detect circle-shaped objects
-    detected_circles = cv2.HoughCircles(dilated_mask, cv2.HOUGH_GRADIENT, 1, 150, param1=100, param2=20, minRadius=2, maxRadius=2000)
-    the_circle = None
-    if detected_circles is not None:
-        for circle in detected_circles[0, :]:
-            x_center = int(circle[0])
-            self.redball_position = x_center
-            circled_orig = cv2.circle(frame, (int(circle[0]), int(circle[1])), int(circle[2]), (0,255,0),thickness=3)
-            the_circle = (int(circle[0]), int(circle[1]))
-        self.target_publisher.publish(self.br.cv2_to_imgmsg(circled_orig))
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    # detect circles
+    circles = cv2.HoughCircles(dilated, cv2.HOUGH_GRADIENT, 1, 150, param1=100, param2=20, minRadius=2, maxRadius=2000)
+    if circles is not None:
+        x_center = int(circles[0][0][0])
+        self.redball_position = x_center  # ✅ This must be set!
+        print(f"[DETECTED] Red ball at x={x_center}")
     else:
-        self.get_logger().info('no ball detected')
-
+        print("[DETECTED] No ball")
