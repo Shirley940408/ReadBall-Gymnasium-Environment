@@ -72,6 +72,7 @@ Make sure to:
 > 4. Test that the red ball is visible
 
 Use rqt or a custom viewer to confirm the ball is in the robot’s view.
+
 ---
 
 ## ▶️ How to Run Agents
@@ -138,6 +139,7 @@ Each agent logs per-episode total rewards:
 > Plots like ppo_returns.png, dqn_returns.png, and non_rl_returns.png visualize agent performance.
 
 ![Demo of red ball tracking](Rviz.gif)
+![Demo of AWS small house with red ball and robot](gazebo.gif)
 ---
 ## 📚 License
 
